@@ -1,0 +1,25 @@
+;;; -*- mode: emacs-lisp; lexical-binding: t -*-
+
+;; Eldev configuration for etaf-image-dired.
+;;
+;; The tests use Buttercup, which Eldev installs from MELPA.  ETAF and its
+;; sibling libraries are not published on a package archive, so point Eldev
+;; at local checkouts.  Override their parent directory with the
+;; ETAF_IMAGE_DIRED_DEPS environment variable when they live elsewhere.
+
+(eldev-use-package-archive 'gnu-elpa)
+(eldev-use-package-archive 'melpa)
+
+(setf eldev-project-main-file "etaf-image-dired.el")
+
+(eldev-add-extra-dependencies 'test 'buttercup)
+
+(let* ((default-root (expand-file-name "~/.emacs.d/jin-emacs/dependencies/elisp/"))
+       (root (file-name-as-directory
+              (or (getenv "ETAF_IMAGE_DIRED_DEPS") default-root))))
+  (dolist (package '("emacs-taf@ecss" "emacs-taf@ekp"
+                     "emacs-taf@ebox" "emacs-taf@etaf"))
+    (let ((directory (expand-file-name package root)))
+      (if (file-directory-p directory)
+          (eldev-use-local-sources directory)
+        (eldev-warn "Local dependency `%s' not found in `%s'" package root)))))
