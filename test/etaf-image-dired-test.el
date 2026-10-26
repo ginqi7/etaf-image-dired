@@ -541,6 +541,39 @@ mounted, so it can test state transitions without rendering anything."
         (expect (etaf-value (etaf-image-dired--session-preview-ref session))
                 :to-equal 'sentinel))))
 
+  (it "marks exactly one card's selection ref"
+    (etaf-image-dired-test--with-session
+      (etaf-image-dired-test--write "a.png")
+      (etaf-image-dired-test--write "b.png")
+      (etaf-image-dired--refresh session)
+      (let ((entries (etaf-image-dired-test--entries session)))
+        (etaf-image-dired-test--select session 0)
+        (expect (seq-count (lambda (entry)
+                             (etaf-value (plist-get entry :selected-ref)))
+                           entries)
+                :to-equal 1)
+        (etaf-image-dired-test--select session 1)
+        (expect (seq-count (lambda (entry)
+                             (etaf-value (plist-get entry :selected-ref)))
+                           entries)
+                :to-equal 1)
+        (expect (etaf-value (plist-get (nth 1 entries) :selected-ref))
+                :to-be-truthy)
+        (expect (etaf-value (plist-get (nth 0 entries) :selected-ref))
+                :to-be nil))))
+
+  (it "does nothing when the selected card is selected again"
+    (etaf-image-dired-test--with-session
+      (etaf-image-dired-test--write "a.png")
+      (etaf-image-dired--refresh session)
+      (let ((ref (plist-get (car (etaf-image-dired-test--entries session))
+                            :ref)))
+        (etaf-image-dired--set-selection session ref)
+        (etaf-set-value (etaf-image-dired--session-split-ref session) t)
+        (etaf-image-dired--set-selection session ref)
+        (expect (etaf-value (etaf-image-dired--session-preview-ref session))
+                :to-be nil))))
+
   (it "clears the selection when the pointer leaves a closed preview"
     (etaf-image-dired-test--with-session
       (spy-on 'etaf-app-state :and-return-value session)

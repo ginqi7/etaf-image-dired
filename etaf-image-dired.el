@@ -129,11 +129,14 @@
 (defconst etaf-image-dired--selection-color "#3B82F6"
   "Frame color of the card under the mouse pointer or keyboard focus.")
 
-(defconst etaf-image-dired--selection-width '(px 1)
+(defconst etaf-image-dired--selection-text-color "white"
+  "Label color on the selected card's name bar.")
+
+(defconst etaf-image-dired--frame-width '(px 1)
   "Width of every card's frame.
-All cards draw a frame of this width, so moving the selection repaints
-borders instead of changing the layout.  Ebox allows only 1px top and
-bottom borders.")
+Every card draws the same frame, so moving the selection repaints borders
+instead of changing the layout.  The selected card is set apart by its frame
+color and by the name bar under the picture rather than by a thicker frame.")
 
 (defconst etaf-image-dired--mark-color "green3"
   "Frame color of a file marked with `etaf-image-dired-mark-thumb-original-file'.")
@@ -224,7 +227,10 @@ selection command before Ebox's own hover handler.")
   directory entries-ref focus-ref preview-ref split-ref preview-width-ref
   marks-ref hidden-ref thumbs-per-row-ref
   refs timer buffer frame resize-behavior
-  dired-buffer slideshow-timer slideshow-delay)
+  dired-buffer slideshow-timer slideshow-delay
+  ;; Appended last: adding a slot in the middle would invalidate sessions
+  ;; created before a live reload of this file.
+  selection-refs)
 
 (defun etaf-image-dired--current-session ()
   "Return the session of the current gallery buffer."
@@ -232,6 +238,25 @@ selection command before Ebox's own hover handler.")
     (unless (etaf-image-dired--session-p session)
       (user-error "Not an image gallery buffer"))
     session))
+
+(defun etaf-image-dired--selection-refs (session)
+  "Return SESSION's table of per-card selection refs.
+It maps a card ref to a ref that is non-nil only while that card is selected.
+Cards subscribe to their own ref, so changing the selection repaints the two
+cards that gained and lost it instead of the whole grid."
+  (or (etaf-image-dired--session-selection-refs session)
+      (setf (etaf-image-dired--session-selection-refs session)
+            (make-hash-table :test #'eq))))
+
+(defun etaf-image-dired--selection-ref (session card-ref)
+  "Return CARD-REF's selection ref in SESSION, creating it on first use."
+  (let ((refs (etaf-image-dired--selection-refs session)))
+    (or (gethash card-ref refs)
+        (puthash card-ref
+                 (etaf-ref nil
+                           :name (intern (concat (symbol-name card-ref)
+                                                 "-selected")))
+                 refs))))
 
 (defun etaf-image-dired--image-files (directory)
   "Return the image files directly inside DIRECTORY, sorted by name."
@@ -475,9 +500,11 @@ or the reactive layer cannot tell the old and the new value apart."
   "Return the gallery entry for FILE, queueing a thumbnail when needed."
   (let* ((thumb (image-dired-thumb-name file))
          (thumb-exists (file-exists-p thumb))
+         (ref (intern (concat "etaf-image-dired-card-" (sha1 file))))
          (entry (list :file file
                       :thumb thumb
-                      :ref (intern (concat "etaf-image-dired-card-" (sha1 file)))
+                      :ref ref
+                      :selected-ref (etaf-image-dired--selection-ref session ref)
                       :name (file-name-nondirectory file))))
     (cond
      ((etaf-image-dired--thumb-current-p file thumb)
@@ -610,11 +637,25 @@ files which no longer exist are dropped."
     (dolist (file files)
       (puthash file t present))
     (setf (etaf-image-dired--session-refs session) refs)
-    (when-let* ((marks-ref (etaf-image-dired--session-marks-ref session)))
-      (etaf-set-value marks-ref
-                      (seq-filter (lambda (pair) (gethash (car pair) present))
-                                  (etaf-value marks-ref))))
-    (etaf-set-value (etaf-image-dired--session-entries-ref session) entries)
+    (let ((focused (etaf-value (etaf-image-dired--session-focus-ref session)))
+          (selection-refs (etaf-image-dired--selection-refs session)))
+      ;; Keep the refs of the cards that survive the rescan; drop the rest.
+      (dolist (card-ref (hash-table-keys selection-refs))
+        (unless (gethash card-ref refs)
+          (remhash card-ref selection-refs)))
+      ;; One batch: recomputing the grid and its selection must repaint the
+      ;; cards once, not once per ref.
+      (etaf-batch
+        (when-let* ((marks-ref (etaf-image-dired--session-marks-ref session)))
+          (etaf-set-value marks-ref
+                          (seq-filter (lambda (pair) (gethash (car pair) present))
+                                      (etaf-value marks-ref))))
+        (dolist (entry entries)
+          (etaf-set-value
+           (etaf-image-dired--selection-ref session (plist-get entry :ref))
+           (eq (plist-get entry :ref) focused)))
+        (etaf-set-value (etaf-image-dired--session-entries-ref session)
+                        entries)))
     (if (seq-some (lambda (entry)
                     (or (eq (plist-get entry :state) 'pending)
                         (plist-get entry :queued-at)))
@@ -876,16 +917,22 @@ When TARGET lies outside the grid and BOUNDARY-MESSAGE is non-nil, show it."
         (message "%s" boundary-message))
       bounded)))
 
+(defun etaf-image-dired--card-pixel-width (session)
+  "Return the border-box width in pixels of one card in SESSION."
+  (let* ((metrics (etaf-image-dired--frame-metrics session))
+         (char-width (max 1 (car metrics)))
+         (box (etaf-image-dired--thumb-box session)))
+    (+ (* (car box) char-width)
+       (* 2 (cadr etaf-image-dired--frame-width)))))
+
 (defun etaf-image-dired--grid-columns (session)
   "Return the number of thumbnail columns SESSION currently shows.
 A fixed line-up wins; otherwise estimate the wrapping of the flex grid from
 the window width, the preview pane and the card size."
   (or (let ((ref (etaf-image-dired--session-thumbs-per-row-ref session)))
         (and ref (etaf-value ref)))
-      (let* ((metrics (etaf-image-dired--frame-metrics session))
-             (char-width (max 1 (car metrics)))
-             (box (etaf-image-dired--thumb-box session))
-             (card-width (+ (* (car box) char-width) 2))
+      (let* ((char-width (max 1 (car (etaf-image-dired--frame-metrics session))))
+             (card-width (etaf-image-dired--card-pixel-width session))
              (gap 16)
              (split (etaf-value (etaf-image-dired--session-split-ref session)))
              (panel-pixels (if split
@@ -902,11 +949,8 @@ the window width, the preview pane and the card size."
 
 (defun etaf-image-dired--grid-pixel-width (session columns)
   "Return the pixel width that fits exactly COLUMNS cards of SESSION.
-Cards are drawn with a 1px frame on each side and separated by a 16px gap."
-  (let* ((metrics (etaf-image-dired--frame-metrics session))
-         (char-width (max 1 (car metrics)))
-         (box (etaf-image-dired--thumb-box session))
-         (card-width (+ (* (car box) char-width) 2)))
+Cards include their side frames and are separated by a 16px gap."
+  (let ((card-width (etaf-image-dired--card-pixel-width session)))
     (+ (* columns card-width)
        (* (max 0 (1- columns)) 16))))
 
@@ -925,18 +969,40 @@ Cards are drawn with a 1px frame on each side and separated by a 16px gap."
     (when-let* ((ref (and runtime (etaf-focused-host-ref runtime))))
       (gethash ref (etaf-image-dired--session-refs session)))))
 
+(defun etaf-image-dired--set-focus (session ref)
+  "Move SESSION's card emphasis to REF, leaving the preview pane alone.
+Each card reads its own selection ref, so only the card losing the emphasis
+and the card gaining it are repainted, never the whole grid."
+  (let ((focus-ref (etaf-image-dired--session-focus-ref session)))
+    (unless (eq ref (etaf-value focus-ref))
+      (let ((selection-refs (etaf-image-dired--selection-refs session)))
+        (etaf-batch
+          (when-let* ((old (etaf-value focus-ref)))
+            (when-let* ((selection-ref (gethash old selection-refs)))
+              (etaf-set-value selection-ref nil)))
+          (when-let* ((selection-ref (and ref (gethash ref selection-refs))))
+            (etaf-set-value selection-ref t))
+          (etaf-set-value focus-ref ref))))))
+
 (defun etaf-image-dired--set-selection (session ref)
   "Make REF the selected card in SESSION.
 An open preview follows the new selection, so hovering another thumbnail
-replaces the picture on the right."
-  (etaf-set-value (etaf-image-dired--session-focus-ref session) ref)
-  (when (etaf-value (etaf-image-dired--session-split-ref session))
-    (etaf-set-value (etaf-image-dired--session-preview-ref session)
-                    (and ref
-                         (gethash ref (etaf-image-dired--session-refs session)))))
-  (when ref
-    (when-let* ((file (gethash ref (etaf-image-dired--session-refs session))))
-      (etaf-image-dired--track-in-dired session file))))
+replaces the picture on the right.  Selecting the card that is already
+selected does nothing, which keeps mouse motion inside one card cheap."
+  (unless (eq ref (etaf-value (etaf-image-dired--session-focus-ref session)))
+    (etaf-batch
+      (etaf-image-dired--set-focus session ref)
+      (when (etaf-value (etaf-image-dired--session-split-ref session))
+        (etaf-set-value (etaf-image-dired--session-preview-ref session)
+                        (and ref
+                             (gethash ref
+                                      (etaf-image-dired--session-refs
+                                       session)))))
+      (when-let* ((file (and ref
+                             (gethash ref
+                                      (etaf-image-dired--session-refs
+                                       session)))))
+        (etaf-image-dired--track-in-dired session file)))))
 
 (defun etaf-image-dired--select-at-position (session position)
   "Select the card painted at buffer POSITION in SESSION.
@@ -1014,10 +1080,12 @@ mode; local `hl-line-mode' is switched off as well."
 
 ;;; View
 
-(defun etaf-image-dired--card-selected-p (session entry)
-  "Return non-nil when ENTRY's card is the selected one in SESSION."
-  (eq (etaf-value (etaf-image-dired--session-focus-ref session))
-      (plist-get entry :ref)))
+(defun etaf-image-dired--card-selected-p (entry)
+  "Return non-nil when ENTRY's card is the selected one.
+Every card owns a selection ref, so reading it subscribes this card alone to
+selection changes instead of subscribing every card to one shared ref."
+  (let ((selection-ref (plist-get entry :selected-ref)))
+    (and selection-ref (etaf-value selection-ref))))
 
 (etaf-define-component etaf-image-dired--card (&key entry session)
   "Render one thumbnail card for ENTRY.
@@ -1035,9 +1103,9 @@ focus, because activation would otherwise win."
          (pad-bottom (max 0 (- box-rows rows pad-top)))
          (file (plist-get entry :file))
          (mark (etaf-image-dired--file-mark session file))
+         (selected (etaf-image-dired--card-selected-p entry))
          (border-color
-          (cond ((etaf-image-dired--card-selected-p session entry)
-                 etaf-image-dired--selection-color)
+          (cond (selected etaf-image-dired--selection-color)
                 ((eq mark 'flagged) etaf-image-dired--flag-color)
                 ((eq mark 'marked) etaf-image-dired--mark-color)
                 (t etaf-image-dired--border-color))))
@@ -1047,8 +1115,7 @@ focus, because activation would otherwise win."
              :height (list 'lh (1+ box-rows))
              :box-sizing 'content-box
              :cross-align 'center
-             :border (list etaf-image-dired--selection-width 'solid
-                           border-color)
+             :border (list etaf-image-dired--frame-width 'solid border-color)
              :item-gap '(lh 0)
              :role 'button
              :tab-index 0
@@ -1062,7 +1129,7 @@ focus, because activation would otherwise win."
              (lambda ()
                (let ((focus-ref (etaf-image-dired--session-focus-ref session)))
                  (when (eq (etaf-value focus-ref) (plist-get entry :ref))
-                   (etaf-set-value focus-ref nil))))
+                   (etaf-image-dired--set-focus session nil))))
        (box :if (> pad-top 0)
             :width (list 'ch box-columns)
             :height (list 'lh pad-top))
@@ -1088,16 +1155,23 @@ focus, because activation would otherwise win."
             :height '(lh 1)
             :overflow 'hidden
             :text-align 'center
+            :background-color (and selected etaf-image-dired--selection-color)
          (text :if (eq mark 'flagged)
                :font-size 14
-               :color etaf-image-dired--flag-color
+               :font-weight (if selected 'bold 'normal)
+               :color (if selected etaf-image-dired--selection-text-color
+                        etaf-image-dired--flag-color)
                (expr (concat "D " (plist-get entry :name))))
          (text :else-if (eq mark 'marked)
                :font-size 14
-               :color etaf-image-dired--mark-color
+               :font-weight (if selected 'bold 'normal)
+               :color (if selected etaf-image-dired--selection-text-color
+                        etaf-image-dired--mark-color)
                (expr (concat "* " (plist-get entry :name))))
          (text :else t
                :font-size 14
+               :font-weight (if selected 'bold 'normal)
+               :color (and selected etaf-image-dired--selection-text-color)
                (expr (plist-get entry :name))))))))
 
 (etaf-define-component etaf-image-dired--library (&key session)
@@ -1931,6 +2005,7 @@ argument, prompt for a directory instead."
                    :thumbs-per-row-ref
                    (etaf-ref nil :name 'etaf-image-dired-thumbs-per-row)
                    :refs (make-hash-table :test #'eq)
+                   :selection-refs (make-hash-table :test #'eq)
                    :frame (selected-frame)))
          (name (format "*etaf-image-dired: %s*" (abbreviate-file-name dir))))
     ;; The drag Behavior must outlive renders: see its docstring.
